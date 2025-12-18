@@ -1,677 +1,537 @@
-import express from 'express'
-import multer from 'multer'
-import path from 'path'
-import fs from 'fs'
-import cors from 'cors'
-import dotenv from 'dotenv'
-import morgan from 'morgan'
-import OpenAI from 'openai'
+import express from "express";
+import multer from "multer";
+import path from "path";
+import fs from "fs";
+import cors from "cors";
+import dotenv from "dotenv";
+import morgan from "morgan";
+import OpenAI from "openai";
 
-dotenv.config()
+dotenv.config();
 
-const app = express()
-app.use(cors())
-app.use(morgan('tiny'))
+const app = express();
+app.use(cors());
+app.use(morgan("tiny"));
+app.use(express.json()); // Parse JSON bodies
 
-const UPLOADS = path.join(process.cwd(), 'uploads')
-const GENERATED = path.join(process.cwd(), 'generated')
-if (!fs.existsSync(UPLOADS)) fs.mkdirSync(UPLOADS)
-if (!fs.existsSync(GENERATED)) fs.mkdirSync(GENERATED)
+const UPLOADS = path.join(process.cwd(), "uploads");
+const GENERATED = path.join(process.cwd(), "generated");
+if (!fs.existsSync(UPLOADS)) fs.mkdirSync(UPLOADS);
+if (!fs.existsSync(GENERATED)) fs.mkdirSync(GENERATED);
 
 const storage = multer.diskStorage({
   destination: (_, __, cb) => cb(null, UPLOADS),
   filename: (_, file, cb) => {
-    const safe = `${Date.now()}-${file.originalname.replace(/[^a-z0-9_.-]/gi, '_')}`
-    cb(null, safe)
-  }
-})
+    const safe = `${Date.now()}-${file.originalname.replace(
+      /[^a-z0-9_.-]/gi,
+      "_"
+    )}`;
+    cb(null, safe);
+  },
+});
 
 const upload = multer({
   storage,
   limits: { fileSize: 20 * 1024 * 1024 }, // 20MB
   fileFilter: (_, file, cb) => {
     const allowed = [
-      'application/pdf',
-      'application/msword',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-      'text/html'
-    ]
-    if (allowed.includes(file.mimetype) || /\.(pdf|doc|docx|html|htm)$/i.test(file.originalname)) cb(null, true)
-    else cb(new Error('Invalid file type'))
-  }
-})
+      "application/pdf",
+      "application/msword",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "text/html",
+      "text/markdown",
+      "text/plain",
+    ];
+    if (
+      allowed.includes(file.mimetype) ||
+      /\.(pdf|doc|docx|html|htm|md|txt)$/i.test(file.originalname)
+    )
+      cb(null, true);
+    else cb(new Error("Invalid file type"));
+  },
+});
 
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 function validateHtml(html: string): { valid: boolean; missing: string[] } {
-  const missing: string[] = []
-  
+  const missing: string[] = [];
+
   // Check for basic HTML structure
-  if (!html.includes('<!doctype html>') && !html.includes('<html')) {
-    missing.push('HTML document structure')
+  if (!html.includes("<!doctype html>") && !html.includes("<html")) {
+    missing.push("HTML document structure");
   }
-  
+
   // Check for required navigation elements
-  if (!html.includes('id="prevBtn"') && !html.includes("id='prevBtn'")) {
-    missing.push('prevBtn element')
-  }
-  if (!html.includes('id="nextBtn"') && !html.includes("id='nextBtn'")) {
-    missing.push('nextBtn element')
-  }
-  if (!html.includes('id="submitQuiz"') && !html.includes("id='submitQuiz'")) {
-    missing.push('submitQuiz button')
-  }
-  if (!html.includes('id="retryBtn"') && !html.includes("id='retryBtn'")) {
-    missing.push('retryBtn element')
-  }
-  if (!html.includes('id="reviewBtn"') && !html.includes("id='reviewBtn'")) {
-    missing.push('reviewBtn element')
-  }
-  
-  // Check for progress elements
-  if (!html.includes('id="progressFill"') && !html.includes("id='progressFill'")) {
-    missing.push('progressFill element')
-  }
-  
-  // Check for quiz structure
-  if (!html.includes('data-correct=')) {
-    missing.push('data-correct attributes on questions')
-  }
-  if (!html.includes('type="radio"')) {
-    missing.push('radio input elements for quiz')
-  }
-  
-  // Check for script functionality
-  const hasScript = /<script[\s\S]*?>[\s\S]*?<\/script>/i.test(html)
-  if (!hasScript) {
-    missing.push('JavaScript functionality')
-  } else {
-    // Check if script contains navigation functions
-    const scriptContent = html.match(/<script[\s\S]*?>([\s\S]*?)<\/script>/i)?.[1] || ''
-    if (!scriptContent.includes('addEventListener') && !scriptContent.includes('onclick')) {
-      missing.push('event listeners in JavaScript')
+  const requiredIds = [
+    "prevBtn",
+    "nextBtn",
+    "submitQuiz",
+    "progressFill",
+    "retryBtn",
+    "resetBtn",
+  ];
+  for (const id of requiredIds) {
+    if (!html.includes(`id="${id}"`) && !html.includes(`id='${id}'`)) {
+      missing.push(`${id} element`);
     }
   }
-  
-  return { valid: missing.length === 0, missing }
+
+  // Check for quiz structure
+  if (!html.includes("data-correct=")) {
+    missing.push("data-correct attributes on questions");
+  }
+  if (!html.includes('type="radio"')) {
+    missing.push("radio input elements for quiz");
+  }
+
+  return { valid: missing.length === 0, missing };
 }
 
 function sanitizeHtml(input: string) {
-  let out = input
+  let out = input;
   // Remove external script tags (with src=...)
-  out = out.replace(/<script[^>]+src=["'][^"']+["'][^>]*>[\s\S]*?<\/script>/gi, '')
-  // For inline scripts, allow them only if they don't contain forbidden patterns (network calls)
-  out = out.replace(/<script[^>]*>([\s\S]*?)<\/script>/gi, (m, code) => {
-    const forbidden = /\b(fetch|XMLHttpRequest|WebSocket|EventSource|navigator\.sendBeacon|import\(|eval|new Function)\b/i
-    if (forbidden.test(code)) return ''
-    return `<script>${code}</script>`
-  })
+  out = out.replace(
+    /<script[^>]+src=["'][^"']+["'][^>]*>[\s\S]*?<\/script>/gi,
+    ""
+  );
   // Remove on* attributes (onclick, onerror, etc.)
-  out = out.replace(/\son\w+=["'][\s\S]*?["']/gi, '')
+  out = out.replace(/\son\w+=["'][\s\S]*?["']/gi, "");
   // Remove javascript: URIs in href/src
-  out = out.replace(/(href|src)=["']javascript:[^"']*["']/gi, '$1="#"')
-  return out
+  out = out.replace(/(href|src)=["']javascript:[^"']*["']/gi, '$1="#"');
+  return out;
 }
 
-function injectRequiredElements(html: string, validation: { valid: boolean; missing: string[] }): string {
-  let updatedHtml = html
-  
-  // If HTML is completely malformed, regeneration is needed - don't inject hardcoded template
-  if (validation.missing.includes('HTML document structure')) {
-    console.log('HTML document structure is completely malformed - regeneration required')
-    return html // Return as-is, let the retry logic handle it
-  }
-  
-  // Inject missing navigation elements with minimal styling (let model's styles take precedence)
-  const needsNavigation = validation.missing.some(item => 
-    ['prevBtn element', 'nextBtn element', 'submitQuiz button', 'retryBtn element', 'reviewBtn element'].includes(item)
-  )
-  
-  if (needsNavigation) {
-    const navigationHtml = `
-        <div class="navigation">
-            <button id="prevBtn" style="display: none;">Previous</button>
-            <button id="nextBtn">Next</button>
-            <button id="submitQuiz" style="display: none;">Submit Quiz</button>
-            <button id="retryBtn" style="display: none;">Retry Quiz</button>
-            <button id="reviewBtn" style="display: none;">Review Module</button>
-        </div>`
-    
-    if (updatedHtml.includes('</body>')) {
-      updatedHtml = updatedHtml.replace('</body>', navigationHtml + '\n</body>')
-    }
-  }
-  
-  // Inject progress bar with minimal styling (let model's styles take precedence)
-  if (validation.missing.includes('progressFill element')) {
-    const progressHtml = `
-        <div class="progress-bar">
-            <div id="progressFill" style="width: 0%;"></div>
-        </div>`
-    
-    // Try to inject after first heading or at start of body
-    if (updatedHtml.includes('<h1')) {
-      updatedHtml = updatedHtml.replace(/<h1[^>]*>.*?<\/h1>/i, match => match + progressHtml)
-    } else if (updatedHtml.includes('<body')) {
-      updatedHtml = updatedHtml.replace(/<body[^>]*>/i, match => match + progressHtml)
-    }
-  }
-  
-  // Inject comprehensive navigation script that overrides any incomplete model-generated scripts
-  const navigationScript = `
-<script>
-// Force override any incomplete navigation functions
-window.currentSlide = window.currentSlide || 0;
-window.quizPassed = window.quizPassed || false;
-const slides = document.querySelectorAll('[data-slide], .slide');
-const progressFill = document.getElementById('progressFill');
-const prevBtn = document.getElementById('prevBtn');
-const nextBtn = document.getElementById('nextBtn');
-const submitBtn = document.getElementById('submitQuiz');
-const retryBtn = document.getElementById('retryBtn');
-const reviewBtn = document.getElementById('reviewBtn');
-
-function showSlide(n) {
-    slides.forEach((slide, index) => {
-        if (slide.classList) {
-            slide.classList.toggle('active', index === n);
-        }
-        slide.style.display = index === n ? 'block' : 'none';
-    });
-    updateProgress();
-    updateButtons();
-    updateSlideCounter();
-}
-
-function updateSlideCounter() {
-    // Update slide counter display (look for common patterns)
-    const counterElements = document.querySelectorAll('#slideCounter, .slide-counter, .section-counter, .progress-text');
-    counterElements.forEach(counter => {
-        if (counter) {
-            const currentNum = currentSlide + 1;
-            const totalNum = slides.length;
-            // Update text content with current slide info
-            if (counter.textContent && counter.textContent.includes('of')) {
-                counter.textContent = counter.textContent.replace(/\d+\s*of\s*\d+/, \`\${currentNum} of \${totalNum}\`);
-            } else if (counter.textContent && counter.textContent.includes('Section')) {
-                counter.textContent = \`Section \${currentNum} of \${totalNum}\`;
-            } else {
-                counter.textContent = \`\${currentNum} / \${totalNum}\`;
-            }
-        }
-    });
-}
-
-function updateProgress() {
-    if (progressFill && slides.length > 0) {
-        const progress = ((currentSlide + 1) / slides.length) * 100;
-        progressFill.style.width = progress + '%';
-    }
-}
-
-function updateButtons() {
-    if (prevBtn) {
-        prevBtn.disabled = currentSlide === 0;
-        prevBtn.style.display = currentSlide === 0 ? 'none' : 'inline-block';
-    }
-    if (nextBtn) {
-        const isLastSlide = currentSlide === slides.length - 1;
-        if (isLastSlide && !quizPassed) {
-            nextBtn.disabled = true;
-            nextBtn.style.display = 'inline-block';
-        } else if (isLastSlide && quizPassed) {
-            nextBtn.textContent = 'Module Complete';
-            nextBtn.disabled = false;
-        } else {
-            nextBtn.disabled = false;
-            nextBtn.style.display = 'inline-block';
-            nextBtn.textContent = 'Next';
-        }
-    }
-    
-    // Show/hide retry and review buttons based on quiz state
-    if (retryBtn && reviewBtn) {
-        const isLastSlide = currentSlide === slides.length - 1;
-        if (isLastSlide && !quizPassed) {
-            retryBtn.style.display = 'inline-block';
-            reviewBtn.style.display = 'inline-block';
-        } else {
-            retryBtn.style.display = 'none';
-            reviewBtn.style.display = 'none';
-        }
-    }
-}
-
-if (prevBtn) prevBtn.addEventListener('click', () => { 
-    if (currentSlide > 0) { 
-        currentSlide--; 
-        showSlide(currentSlide); 
-    } 
-});
-
-if (nextBtn) nextBtn.addEventListener('click', () => { 
-    if (currentSlide < slides.length - 1) { 
-        currentSlide++; 
-        showSlide(currentSlide); 
-    } else if (quizPassed) {
-        alert('Module completed successfully!');
-    }
-});
-
-if (submitBtn) submitBtn.addEventListener('click', () => {
-    const questions = document.querySelectorAll('[data-correct], .quiz-question[data-correct]');
-    let score = 0;
-    let totalQuestions = questions.length;
-    
-    questions.forEach((question, index) => {
-        const selectedAnswer = question.querySelector('input[type="radio"]:checked');
-        const correctAnswer = question.getAttribute('data-correct');
-        const isCorrect = selectedAnswer && selectedAnswer.value === correctAnswer;
-        
-        if (isCorrect) {
-            score++;
-        }
-        
-        // Visual feedback: ONLY mark the selected option with icon
-        if (selectedAnswer) {
-            const selectedOption = selectedAnswer.closest('.quiz-option, label');
-            if (selectedOption) {
-                // Add icon to indicate correct/incorrect
-                const icon = isCorrect ? ' ✓' : ' ✗';
-                if (!selectedOption.textContent.includes('✓') && !selectedOption.textContent.includes('✗')) {
-                    selectedOption.textContent += icon;
-                }
-                
-                // Light styling for selected option only
-                if (isCorrect) {
-                    selectedOption.style.backgroundColor = '#f0f9f0';
-                    selectedOption.style.color = '#2d6a2d';
-                } else {
-                    selectedOption.style.backgroundColor = '#faf0f0';
-                    selectedOption.style.color = '#6d2d2d';
-                }
-            }
-        }
-    });
-    
-    const percentage = totalQuestions > 0 ? Math.round((score / totalQuestions) * 100) : 0;
-    quizPassed = percentage >= 75;
-    updateButtons();
-    
-    alert(\`Quiz completed! Score: \${score}/\${totalQuestions} (\${percentage}%)\${quizPassed ? ' - You passed!' : ' - You need 75% to proceed. Use Retry or Review buttons.'}\`);
-});
-
-// Retry button functionality
-if (retryBtn) retryBtn.addEventListener('click', () => {
-    // Clear all radio button selections
-    const radioInputs = document.querySelectorAll('input[type="radio"]');
-    radioInputs.forEach(input => input.checked = false);
-    
-    // Hide all feedback messages
-    const feedbacks = document.querySelectorAll('.feedback, .result-banner, .quiz-message');
-    feedbacks.forEach(feedback => {
-        feedback.style.display = 'none';
-        feedback.textContent = '';
-    });
-    
-    // Clear visual feedback styling and icons
-    const quizOptions = document.querySelectorAll('.quiz-option, label');
-    quizOptions.forEach(option => {
-        option.style.backgroundColor = '';
-        option.style.borderColor = '';
-        option.style.color = '';
-        // Remove checkmark and X icons
-        if (option.textContent) {
-            option.textContent = option.textContent.replace(/ ✓$/, '').replace(/ ✗$/, '');
-        }
-    });
-    
-    // Reset quiz state
-    quizPassed = false;
-    updateButtons();
-    
-    alert('Quiz reset! You can now attempt the quiz again.');
-});
-
-// Review button functionality  
-if (reviewBtn) reviewBtn.addEventListener('click', () => {
-    currentSlide = 0;
-    showSlide(0);
-    alert('Returning to the beginning of the module for review.');
-});
-
-// Initialize when page loads
-document.addEventListener('DOMContentLoaded', function() {
-    if (slides.length > 0) {
-        showSlide(0);
-        updateSlideCounter();
-    }
-});
-
-// Fallback initialization and override incomplete model functions
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        showSlide(0);
-        updateSlideCounter();
-        // Override any incomplete updateSlide function from model
-        if (typeof window.updateSlide === 'function') {
-            const originalUpdateSlide = window.updateSlide;
-            window.updateSlide = function() {
-                originalUpdateSlide.apply(this, arguments);
-                updateSlideCounter(); // Ensure slideCounter always gets updated
-            };
-        }
-    });
-} else {
-    showSlide(0);
-    updateSlideCounter();
-    // Override any incomplete updateSlide function from model
-    if (typeof window.updateSlide === 'function') {
-        const originalUpdateSlide = window.updateSlide;
-        window.updateSlide = function() {
-            originalUpdateSlide.apply(this, arguments);
-            updateSlideCounter(); // Ensure slideCounter always gets updated
-        };
-    }
-}
-</script>`
-
-  // Only inject script if it's missing or incomplete
-  if (validation.missing.includes('JavaScript functionality') || validation.missing.includes('event listeners in JavaScript')) {
-    if (updatedHtml.includes('</body>')) {
-      updatedHtml = updatedHtml.replace('</body>', navigationScript + '\n</body>')
-    } else {
-      updatedHtml += navigationScript
-    }
-  }
-  
-  return updatedHtml
-}
-
-app.use('/uploads', express.static(UPLOADS))
-app.use('/generated', express.static(GENERATED))
+app.use("/uploads", express.static(UPLOADS));
+app.use("/generated", express.static(GENERATED));
 
 // Download route: forces the browser to download the generated HTML file
-app.get('/generated/:name/download', (req, res) => {
+app.get("/generated/:name/download", (req, res) => {
   try {
-    const name = path.basename(req.params.name)
-    const p = path.join(GENERATED, name)
-    if (!fs.existsSync(p)) return res.status(404).send('Not found')
-    res.setHeader('Content-Disposition', `attachment; filename="${name}"`)
-    return res.sendFile(p)
-  } catch (err: any) {
-    console.error('download error', err)
-    return res.status(500).send('Download failed')
-  }
-})
+    const name = path.basename(req.params.name);
+    const p = path.join(GENERATED, name);
 
-app.post('/api/generate', upload.fields([{ name: 'attachment', maxCount: 1 }, { name: 'template', maxCount: 1 }]), async (req, res) => {
-  try {
-    const moduleName = (req.body.moduleName || '').toString()
-    const difficulty = (req.body.difficulty || 'easy').toString()
-    const numQuestions = Number(req.body.numQuestions || 10)
+    console.log("Download request for:", name);
+    console.log("File path:", p);
+    console.log("File exists:", fs.existsSync(p));
 
-    let urls: string[] = []
-    if (req.body.urls) {
-      try {
-        urls = typeof req.body.urls === 'string' ? JSON.parse(req.body.urls) : req.body.urls
-      } catch {
-        // if it was sent as repeated fields, coerce into array
-        urls = Array.isArray(req.body.urls) ? req.body.urls : [req.body.urls]
-      }
+    if (!fs.existsSync(p)) {
+      console.error("File not found:", p);
+      return res.status(404).send("File not found");
     }
 
-    const files = (req as any).files || {}
-    const attachmentFile = Array.isArray(files.attachment) ? files.attachment[0] : undefined
-    const templateFile = Array.isArray(files.template) ? files.template[0] : undefined
+    const stats = fs.statSync(p);
+    console.log("File size:", stats.size, "bytes");
 
-    if (!moduleName) return res.status(400).json({ ok: false, error: 'moduleName required' })
-    if (!attachmentFile) return res.status(400).json({ ok: false, error: 'attachment required' })
+    res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+    res.setHeader("Content-Type", "text/html");
+    return res.sendFile(p);
+  } catch (err: any) {
+    console.error("download error", err);
+    return res.status(500).send("Download failed");
+  }
+});
 
-    const attachmentPath = `/uploads/${path.basename(attachmentFile.path)}`
-
-    // Extract text or HTML from the attachment (PDF/DOCX/HTML)
-    let attachmentContent = ''
+app.post(
+  "/api/generate",
+  upload.fields([
+    { name: "attachment", maxCount: 1 },
+    { name: "template", maxCount: 1 },
+  ]),
+  async (req, res) => {
     try {
-      const ext = path.extname(attachmentFile.originalname || '').toLowerCase()
-      if (ext === '.pdf') {
+      const moduleName = (req.body.moduleName || "").toString();
+      const difficulty = (req.body.difficulty || "easy").toString();
+      const numQuestions = Number(req.body.numQuestions || 10);
+      const selectedTemplate = (req.body.selectedTemplate || "").toString();
+
+      console.log("Received parameters:");
+      console.log("- moduleName:", moduleName);
+      console.log("- difficulty:", difficulty);
+      console.log("- numQuestions:", numQuestions);
+      console.log("- selectedTemplate:", selectedTemplate);
+
+      let mediaItems: Array<{
+        id: string;
+        type: string;
+        url: string;
+        description: string;
+      }> = [];
+      if (req.body.mediaItems) {
+        try {
+          mediaItems =
+            typeof req.body.mediaItems === "string"
+              ? JSON.parse(req.body.mediaItems)
+              : req.body.mediaItems;
+        } catch {
+          console.warn("Failed to parse mediaItems, using empty array");
+          mediaItems = [];
+        }
+      }
+
+      const files = (req as any).files || {};
+      const attachmentFile = Array.isArray(files.attachment)
+        ? files.attachment[0]
+        : undefined;
+      const templateFile = Array.isArray(files.template)
+        ? files.template[0]
+        : undefined;
+
+      if (!moduleName)
+        return res
+          .status(400)
+          .json({ ok: false, error: "moduleName required" });
+      if (!attachmentFile)
+        return res
+          .status(400)
+          .json({ ok: false, error: "attachment required" });
+
+      const attachmentPath = `/uploads/${path.basename(attachmentFile.path)}`;
+
+      // Extract text or HTML from the attachment (PDF/DOCX/HTML)
+      let attachmentContent = "";
+      try {
+        const ext = path
+          .extname(attachmentFile.originalname || "")
+          .toLowerCase();
+        if (ext === ".pdf") {
           // optional pdf extraction (pdf-parse may not be installed in every environment)
-          let pdfParse: any = null
+          let pdfParse: any = null;
           try {
-            pdfParse = require('pdf-parse')
+            pdfParse = require("pdf-parse");
           } catch (e) {
-            console.warn('pdf-parse not installed; skipping PDF text extraction')
+            console.warn(
+              "pdf-parse not installed; skipping PDF text extraction"
+            );
           }
           if (pdfParse) {
-            const dataBuffer = fs.readFileSync(attachmentFile.path)
-            const parsed = await pdfParse(dataBuffer)
-            attachmentContent = parsed.text || ''
+            const dataBuffer = fs.readFileSync(attachmentFile.path);
+            const parsed = await pdfParse(dataBuffer);
+            attachmentContent = parsed.text || "";
           } else {
-            attachmentContent = ''
+            attachmentContent = "";
           }
-        } else if (ext === '.docx') {
+        } else if (ext === ".docx") {
           // optional docx extraction via mammoth
-          let mammoth: any = null
+          let mammoth: any = null;
           try {
-            mammoth = require('mammoth')
+            mammoth = require("mammoth");
           } catch (e) {
-            console.warn('mammoth not installed; skipping DOCX to HTML conversion')
+            console.warn(
+              "mammoth not installed; skipping DOCX to HTML conversion"
+            );
           }
-          if (mammoth && typeof mammoth.convertToHtml === 'function') {
-            const result = await mammoth.convertToHtml({ path: attachmentFile.path })
-            attachmentContent = result.value || ''
+          if (mammoth && typeof mammoth.convertToHtml === "function") {
+            const result = await mammoth.convertToHtml({
+              path: attachmentFile.path,
+            });
+            attachmentContent = result.value || "";
           } else {
-            attachmentContent = ''
+            attachmentContent = "";
           }
-      } else if (ext === '.html' || ext === '.htm') {
-        attachmentContent = fs.readFileSync(attachmentFile.path, 'utf-8')
-      } else {
-        // fallback: try reading as utf-8 text
-        try { attachmentContent = fs.readFileSync(attachmentFile.path, 'utf-8') } catch { attachmentContent = '' }
-      }
-    } catch (ex) {
-      console.warn('Attachment parsing failed', ex)
-      attachmentContent = ''
-    }
-
-    // Read and sanitize template reference if provided
-    let templateHtml = ''
-    if (templateFile) {
-      try {
-        templateHtml = fs.readFileSync(templateFile.path, 'utf-8')
-        // strip scripts from template
-        templateHtml = templateHtml.replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '')
+        } else if (ext === ".html" || ext === ".htm") {
+          attachmentContent = fs.readFileSync(attachmentFile.path, "utf-8");
+        } else {
+          // fallback: try reading as utf-8 text
+          try {
+            attachmentContent = fs.readFileSync(attachmentFile.path, "utf-8");
+          } catch {
+            attachmentContent = "";
+          }
+        }
       } catch (ex) {
-        console.warn('Template read failed', ex)
-        templateHtml = ''
+        console.warn("Attachment parsing failed", ex);
+        attachmentContent = "";
       }
-    }
 
-  const system = `You are an expert frontend developer and UX designer. Produce exactly one complete HTML document (including <!doctype html> and <html> root). Output only the HTML — no explanation, no markdown fences, no extra text.
+      // CRITICAL: Limit attachment content to prevent token overflow
+      // Roughly 4 chars = 1 token, so 100k chars ≈ 25k tokens
+      const maxContentLength = 100000; // ~25k tokens for content
+      if (attachmentContent.length > maxContentLength) {
+        console.warn(
+          `Attachment content truncated from ${attachmentContent.length} to ${maxContentLength} chars`
+        );
+        attachmentContent =
+          attachmentContent.substring(0, maxContentLength) +
+          "\n\n[Content truncated due to size limits...]";
+      }
 
-CRITICAL CONTENT RULE: 
-- ALL educational content must be extracted from the PRIMARY_CONTENT_SOURCE in the user prompt
-- If DESIGN_REFERENCE is provided, use ONLY its visual styling (colors, fonts, layout) - NEVER copy its text content
-- Create original educational content based on the source document provided
+      // Read design instructions based on selected template or uploaded file
+      let designInstructions;
+      try {
+        if (templateFile && fs.existsSync(templateFile.path)) {
+          // Custom template uploaded
+          designInstructions = fs.readFileSync(templateFile.path, "utf-8");
+          console.log(
+            "Using uploaded design instructions:",
+            templateFile.filename
+          );
+        } else if (selectedTemplate && selectedTemplate !== "custom") {
+          // Map template IDs 1,2,3 to design files
+          let templateFilename;
+          if (selectedTemplate === "1") {
+            templateFilename = "design1.md";
+          } else if (selectedTemplate === "2") {
+            templateFilename = "design2.md";
+          } else if (selectedTemplate === "3") {
+            templateFilename = "design3.md";
+          } else {
+            // For backward compatibility with design1, design2, etc.
+            templateFilename = `${selectedTemplate}.md`;
+          }
 
-CRITICAL REQUIREMENTS - YOUR OUTPUT WILL BE VALIDATED:
-1. Include EXACTLY these element IDs: prevBtn, nextBtn, submitQuiz, progressFill, retryBtn, reviewBtn
-2. Include data-correct attributes on ALL quiz questions
-3. DO NOT create your own slide counters - navigation counters will be handled by existing JavaScript
-4. Include complete JavaScript with event listeners for navigation that:
-   - Updates progressFill width correctly: ((currentSlide + 1) / totalSlides) * 100 + '%'
-   - Updates slide counter display when navigating (if counter elements exist)
-   - Disables prevBtn on first slide, disables nextBtn on last slide until quiz passed
-   - Enables nextBtn only after quiz score >= 75%
-   - Shows retryBtn and reviewBtn when quiz fails (< 75%)
-   - retryBtn: clears quiz selections and feedback for new attempt
-   - reviewBtn: navigates back to first slide (index 0) for content review
-   - Quiz feedback: ONLY highlight the selected answer option with green checkmark (✓) or red X (✗)
-   - DO NOT highlight entire questions or show correct answers - only mark selected options as right/wrong
-5. Use radio inputs with type="radio" for quiz options
-6. Structure must be valid HTML with proper <!doctype html> declaration
+          const templatePath = path.join(
+            process.cwd(),
+            "templates",
+            templateFilename
+          );
 
-Use only self-contained inline JavaScript and CSS, no external scripts. Inline JavaScript must not perform network requests. The document will be consumed as a standalone downloadable module page.`
+          if (fs.existsSync(templatePath)) {
+            designInstructions = fs.readFileSync(templatePath, "utf-8");
+            console.log(
+              `Using selected template: ${selectedTemplate} (${templateFilename})`
+            );
+          } else {
+            throw new Error(
+              `Template "${selectedTemplate}" (${templateFilename}) not found`
+            );
+          }
+        } else {
+          // Use default template (design2.md for better consistency)
+          const templatesDir = path.join(process.cwd(), "templates");
+          const enhancedDesignPath = path.join(templatesDir, "design2.md");
+          const defaultDesignPath = path.join(templatesDir, "design1.md");
 
-  // Build a strict user prompt with clear content separation
-  let user = `Module metadata:
-moduleName: ${moduleName}
-difficulty: ${difficulty}
-numQuestions: ${numQuestions}
-mediaUrls: ${JSON.stringify(urls)}
+          // Fallback to root directory if templates directory doesn't exist
+          const rootEnhancedPath = path.join(process.cwd(), "design2.md");
+          const rootDefaultPath = path.join(process.cwd(), "design1.md");
 
-PRIMARY_CONTENT_SOURCE_START
-${attachmentContent || `Note: Attachment content could not be extracted. Use the attachment name (${attachmentFile.originalname}) as reference.`}
-PRIMARY_CONTENT_SOURCE_END
+          if (fs.existsSync(enhancedDesignPath)) {
+            designInstructions = fs.readFileSync(enhancedDesignPath, "utf-8");
+            console.log(
+              "Using enhanced design instructions: templates/design2.md"
+            );
+          } else if (fs.existsSync(defaultDesignPath)) {
+            designInstructions = fs.readFileSync(defaultDesignPath, "utf-8");
+            console.log(
+              "Using default design instructions: templates/design1.md"
+            );
+          } else if (fs.existsSync(rootEnhancedPath)) {
+            designInstructions = fs.readFileSync(rootEnhancedPath, "utf-8");
+            console.log("Using enhanced design instructions: design2.md");
+          } else if (fs.existsSync(rootDefaultPath)) {
+            designInstructions = fs.readFileSync(rootDefaultPath, "utf-8");
+            console.log("Using default design instructions: design1.md");
+          } else {
+            throw new Error("No design instructions file found");
+          }
+        }
+      } catch (ex) {
+        console.error("Failed to read design instructions:", ex);
+        return res.status(500).json({
+          ok: false,
+          error: "Failed to load design instructions",
+        });
+      }
 
-${templateHtml ? `
-DESIGN_REFERENCE_ONLY_START
-${templateHtml}
-DESIGN_REFERENCE_ONLY_END
+      // Design instructions are critical - DO NOT truncate them
+      // The complete instructions ensure consistent, functional modules
+      console.log(
+        `Using complete design instructions: ${designInstructions.length} characters`
+      );
 
-CRITICAL: The above DESIGN_REFERENCE is ONLY for visual styling, colors, fonts, and layout inspiration. 
-DO NOT copy any textual content from DESIGN_REFERENCE. 
-ALL content must come from PRIMARY_CONTENT_SOURCE above.
-` : ''}
+      const system = `You are an expert frontend developer creating educational modules. 
 
-REQUIREMENTS (read these carefully and implement them in the HTML):
-1) Entire output must be a single complete HTML document. Return only the HTML. No markdown fences, no commentary.
-2) CONTENT EXTRACTION RULES:
-   - ALL educational content MUST come from PRIMARY_CONTENT_SOURCE above
-   - Extract and elaborate on concepts, topics, definitions, examples from the source document
-   - If DESIGN_REFERENCE is provided, use ONLY its visual styling (colors, fonts, layout) - NOT its text content
-   - Create comprehensive educational slides based on the source material
-   - Each slide should contain substantial content from the document (minimum 3-4 sentences per concept)
-3) Page purpose: a single-module learning page for students. The page should present the module content first, then a quiz section at the end.
-   - Detailed explanations (minimum 3-4 sentences per concept)
-   - Key points, definitions, and examples from the source material  
-   - Relevant details that help students understand the topic thoroughly
-   - DO NOT create slides with only 1-2 lines - provide comprehensive learning content
-3) Navigation/flow: Provide an in-page navigation experience with Previous/Next buttons that work correctly:
-   - Progress bar with ID "progressFill" must update correctly as user navigates (calculate percentage: (currentSlide + 1) / totalSlides * 100)
-   - Section counter display (e.g., "Section 1 of 8") must update as user navigates between slides
-   - Previous button should be disabled/hidden on first slide
-   - Next button should be disabled/hidden on the LAST slide (quiz page) until quiz is passed with >= 75%
-   - Only show "Next Module" or completion message after successful quiz completion
-   - Navigation must properly handle slide transitions.
-4) Quiz: Generate exactly ${numQuestions} multiple-choice questions matching difficulty ${difficulty}. Each question must have four options labeled A, B, C, D. For each question, encode the correct answer in a machine-readable attribute on the question container (e.g., data-correct="B"). Provide radio inputs for options, visible option labels, and per-question feedback elements that are shown after submit.
-5) Client-side grading & gating: Provide inline JavaScript that:
-   - Grades the quiz entirely in the browser (no network calls)
-   - Shows per-question feedback and summary (score % and pass/fail)
-   - CRITICAL: Quiz feedback RULES:
-     * ONLY highlight the selected answer option (not entire question)
-     * Correct selections: add green checkmark icon (✓) to the selected option
-     * Incorrect selections: add red X icon (✗) to the selected option
-     * DO NOT show what the correct answer is - only mark if selection was right/wrong
-     * DO NOT highlight entire question containers or unselected options
-   - CRITICAL: Next button must be disabled on quiz page until score >= 75%
-   - On quiz pass (>= 75%): Enable Next button or show "Module Complete" message
-   - On quiz fail (< 75%): Keep Next button disabled, show TWO buttons:
-     * "Retry Quiz" button - clears all selections and feedback, allows new attempt
-     * "Review Module" button - takes user back to slide 0 to review content
-   - Progress bar must properly reflect navigation state throughout
-6) Accessibility: Use semantic HTML (main, header, nav, section, button). Ensure forms/inputs have labels or aria-labels. Keyboard navigation must work for quiz options and navigation controls.
-7) Styling & design: Use an engaging, student-friendly layout (colors, contrast, readable typography, large tap/click targets). If TEMPLATE_HTML_REFERENCE is provided, CLOSELY FOLLOW its visual design, color scheme, typography, layout patterns, and CSS structure — but DO NOT copy its textual content. Extract and adapt the template's aesthetic elements (colors, fonts, spacing, component styles) to create a cohesive design. If no template is provided, create an engaging modern design.
-8) Media embedding: Place mediaUrls content in the module where appropriate (embedded images or videos). Use safe embedding (img tags with alt text or <video> if mp4), but do not load remote scripts.
-9) Offline friendliness: The file should be self-contained for the quiz behavior. Avoid remote dependencies for JS. Small assets can be used by direct URL, but do not rely on remote scripts.
-10) Security: Do not include any analytics, trackers, or external scripts. Avoid inline eval or dynamic code loading. If you must include inline JS, it must be straightforward DOM manipulation and event handlers.
-11) Content depth requirements: Each slide must contain substantial educational content:
-    - Extract key concepts, definitions, examples, and detailed explanations from the attachment
-    - Minimum 3-4 sentences per concept, with supporting details and context
-    - Include practical examples, case studies, or applications where relevant
-    - Break complex topics into digestible but comprehensive chunks
-    - Ensure students get thorough understanding of each topic before moving to quiz
-12) Behavior on missing attachment: If the attachment content is empty or not provided, create a clear content placeholder section and generate questions based on the moduleName and the attachment filename.
-12) File readiness: The returned HTML must be immediately savable to disk (e.g., module-123.html) and render correctly in a browser.
+🚨 ABSOLUTE REQUIREMENTS - ZERO TOLERANCE FOR OMISSIONS:
+1. EVERY WORD EXTRACTION: Extract and include EVERY SINGLE WORD, SENTENCE, PARAGRAPH from source
+2. UNLIMITED SLIDES: Create 10, 15, 20+ slides if needed - NO SLIDE COUNT LIMITS EVER
+3. ZERO CONDENSING: Never summarize, paraphrase, or shorten ANY content from source
+4. WORD-FOR-WORD: Use exact language and complete sentences from source document
+5. COMPLETE PROCEDURES: Include every step, substep, detail of any process
+6. ALL EXAMPLES: Every case study, scenario, illustration must be included completely
+7. CONSISTENCY: All modules must have identical layouts, spacing, and styling
+8. PERFECT QUIZ LAYOUT: All quiz options must be properly aligned and spaced consistently
+4. EXACT STRUCTURE: Follow DESIGN_INSTRUCTIONS precisely - no variations or shortcuts
+5. MEDIA PLACEHOLDERS: Replace any placeholders like {{image:ID}} or {{video:ID}} found in source content with actual HTML elements using corresponding URLs from Media Items
+6. MANDATORY LOCALSTORAGE: MUST include localStorage functionality for score and progress persistence
 
-OUTPUT FORMAT (strict):
-- Output a single HTML file that includes:
-  - A prominent title with the moduleName.
-  - The module content (derived from the attachment content) - EXTRACT COMPREHENSIVE DETAILS from source material
-  - Content broken into logical sections/slides with SUBSTANTIAL content (minimum 3-4 paragraphs per slide)
-  - Media embeds for provided mediaUrls.
-  - Quiz section with exactly ${numQuestions} MCQs, data-correct attributes, and a submit button.
-  - Inline JS that grades and controls the Next Module control (pass threshold 75%).
-  - If you include a slide counter element (like id="slideCounter"), ensure your JavaScript updateSlide function updates it with the current slide number
-  - No additional text outside the HTML.
-`
+MANDATORY LOCALSTORAGE IMPLEMENTATION:
+- MUST include localStorage.setItem("score", score.toString()) in submitQuiz function after score calculation
+- MUST include localStorage.setItem("passed", "true") when quiz is passed (score >= 75%)
+- MUST include localStorage.setItem("progress", this.currentSlide) in saveProgress function
+- MUST include localStorage.getItem("score"), localStorage.getItem("passed"), and localStorage.getItem("progress") in loadProgress function
+- This localStorage functionality is CRITICAL for user progress tracking and MUST be included in every generated module
 
-    // Attempt generation with validation and retry logic
-    let finalHtml = ''
-    let attemptCount = 0
-    const maxAttempts = 3
+MEDIA PLACEHOLDER PROCESSING - CONSISTENT SIZING:
+- When you encounter {{image:ID}}, replace with: <div class="media-container"><img src="[URL_FOR_ID]" alt="[DESCRIPTION_FOR_ID]" class="responsive-image"></div>
+- When you encounter {{video:ID}}, replace with: <div class="media-container"><video src="[URL_FOR_ID]" controls class="responsive-video">[DESCRIPTION_FOR_ID]</video></div>
+- ALWAYS wrap images and videos in media-container div for consistent 300px height
+- Match the ID in the placeholder with the corresponding Media Item to get the URL and description
+- If no matching Media Item is found for an ID, replace with: <div class="media-placeholder">[Media: ID not found]</div>
+- The CSS provides consistent sizing: all images/videos will be 300px height with proper aspect ratio maintained via object-fit: cover
 
-    while (attemptCount < maxAttempts && !finalHtml) {
-      attemptCount++
-      console.log(`Generation attempt ${attemptCount}/${maxAttempts}`)
+OUTPUT REQUIREMENT: Generate EXACTLY ONE complete HTML document. Output ONLY the HTML - no explanations, no markdown fences, no extra text.
+
+The HTML document must be fully functional and self-contained for student use.`;
+
+      // Build enhanced user prompt with specific requirements
+      let user = `DESIGN_INSTRUCTIONS (FOLLOW EXACTLY - NO DEVIATIONS):
+${designInstructions}
+
+MODULE_DATA:
+- Name: ${moduleName}
+- Difficulty: ${difficulty}  
+- Questions: ${numQuestions}
+- Media Items: ${JSON.stringify(mediaItems)}
+
+CRITICAL REQUIREMENTS FOR THIS MODULE:
+⚠️ COMPLETE JAVASCRIPT - Must include ModuleController class, all navigation functions, and event handlers
+⚠️ WORKING BUTTONS - All navigation, quiz, retry, and reset buttons must be functional
+⚠️ DO NOT TRUNCATE - Generate complete HTML file even if output is long
+🚨 MANDATORY WORD-FOR-WORD EXTRACTION - Include EVERY single word from source document
+🚨 UNLIMITED SLIDES REQUIRED - Create 10, 15, 20+ slides if source content demands it
+🚨 ZERO EDITORIAL DECISIONS - Do not decide what is "important" vs "less important" - include everything
+🚨 COPY-PASTE MENTALITY - Treat source as sacred text that cannot be altered or shortened
+🚨 NO PARAPHRASING ALLOWED - Use exact language and terminology from source
+🚨 COMPLETE EXTRACTION - Source word count should approximately equal slide content word count
+⚠️ MAINTAIN LAYOUT CONSISTENCY - Use exact CSS dimensions and spacing as specified
+⚠️ PERFECT QUIZ ALIGNMENT - Ensure all quiz options are properly formatted and aligned
+⚠️ MANDATORY LOCALSTORAGE - MUST include localStorage.setItem for score, passed status, and progress tracking
+⚠️ SCORE PERSISTENCE - After calculating quiz score, MUST save it: localStorage.setItem("score", score.toString())
+⚠️ COMPLETION TRACKING - When quiz passed, MUST save: localStorage.setItem("passed", "true")
+
+PRIMARY_CONTENT_SOURCE:
+${
+  attachmentContent ||
+  `Content extraction failed. Use filename "${attachmentFile.originalname}" as reference for ${moduleName} module.`
+}
+
+🚨🚨 UNBREAKABLE CONTENT EXTRACTION RULES 🚨🚨:
+🚨 EXTRACT EVERY SINGLE WORD from the source document above - count sentences to verify
+🚨 CREATE UNLIMITED SLIDES (10, 15, 20+ slides) to accommodate all content
+🚨 NEVER EVER condense, summarize, paraphrase, or skip even one sentence
+🚨 PRESERVE ORIGINAL LANGUAGE - use exact phrasing from document
+🚨 INCLUDE ALL DETAILS - every explanation, example, procedure, definition
+🚨 NO SLIDE LIMITS - document length determines slide count, not arbitrary numbers
+🚨 MENTAL MODEL: You are a court stenographer preserving every word, not an editor
+
+MANDATORY CODE SNIPPETS TO INCLUDE:
+The submitQuiz() function MUST contain these exact lines after score calculation:
+  // Store score in localStorage
+  localStorage.setItem("score", score.toString());
+  
+  // Store passed status if successful
+  if (passed) {
+    localStorage.setItem("passed", "true");
+  }
+
+The loadProgress() function MUST contain these exact lines:
+  if (localStorage.getItem("passed") === "true") {
+    const score = localStorage.getItem("score") || "75";
+    // Show completion banner with actual score
+  }
+
+TASK: Generate a complete interactive educational HTML module following the DESIGN_INSTRUCTIONS above. Use the PRIMARY_CONTENT_SOURCE for all educational content and generate exactly ${numQuestions} quiz questions at ${difficulty} difficulty level.`;
+
+      console.log(
+        `Final prompt includes: ${numQuestions} questions at ${difficulty} difficulty`
+      );
+
+      // Estimate total tokens (rough: 4 chars = 1 token)
+      const systemTokens = Math.ceil(system.length / 4);
+      const userTokens = Math.ceil(user.length / 4);
+      const totalInputTokens = systemTokens + userTokens;
+
+      console.log(
+        `Token estimates - System: ${systemTokens}, User: ${userTokens}, Total: ${totalInputTokens}`
+      );
+
+      if (totalInputTokens > 150000) {
+        // Leave room for output tokens
+        return res.status(400).json({
+          ok: false,
+          error: `Input too large (${totalInputTokens} tokens). Please use smaller documents or fewer media items.`,
+        });
+      }
+
+      // Token estimation for debugging
+      const systemPromptTokens = Math.ceil(system.length / 4);
+      const userPromptTokens = Math.ceil(user.length / 4);
+      const totalEstimatedTokens = systemPromptTokens + userPromptTokens;
+
+      console.log("Token Estimation:", {
+        systemPrompt: `${systemPromptTokens} tokens (${system.length} chars)`,
+        userPrompt: `${userPromptTokens} tokens (${user.length} chars)`,
+        totalEstimated: `${totalEstimatedTokens} tokens`,
+      });
+
+      // Generate HTML module
+      console.log("Generating HTML module...");
 
       const completion = await client.chat.completions.create({
-        model: 'gpt-4o-mini',
+        model: "gpt-4o-mini",
         messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user }
+          { role: "system", content: system },
+          { role: "user", content: user },
         ],
-        temperature: attemptCount === 1 ? 0.2 : 0.3, // Slightly higher temp on retries
-        // Increased token allowance to reduce truncation
-        max_completion_tokens: attemptCount === 1 ? 6000 : 8000
-      })
+        temperature: 0.3,
+        max_completion_tokens: 16000, // Increased for complete HTML with full JavaScript
+      });
 
-      let html = completion.choices?.[0]?.message?.content || ''
+      let html = completion.choices?.[0]?.message?.content || "";
       if (!html) {
-        console.log(`Attempt ${attemptCount}: Empty response from model`)
-        continue
+        return res
+          .status(500)
+          .json({ ok: false, error: "Empty response from OpenAI" });
       }
 
       // Strip common markdown fences (```html ... ```)
-      html = html.replace(/^\s*```(?:html)?\s*/i, '')
-      html = html.replace(/\s*```\s*$/i, '')
+      html = html.replace(/^\s*```(?:html)?\s*/i, "");
+      html = html.replace(/\s*```\s*$/i, "");
 
       // Validate the generated HTML
-      const validation = validateHtml(html)
-      console.log(`Attempt ${attemptCount}: Validation result:`, validation)
+      const validation = validateHtml(html);
+      console.log("Validation result:", validation);
 
-      if (validation.valid) {
-        // HTML is valid, apply basic sanitization
-        finalHtml = sanitizeHtml(html)
-        console.log(`Attempt ${attemptCount}: Success - HTML is valid`)
-        break
-      } else {
-        console.log(`Attempt ${attemptCount}: Invalid HTML, missing:`, validation.missing)
-        
-        // If this is the last attempt, try to fix the HTML
-        if (attemptCount === maxAttempts) {
-          console.log('Final attempt: Applying auto-fix')
-          const sanitized = sanitizeHtml(html)
-          finalHtml = injectRequiredElements(sanitized, validation)
-          break
-        } else {
-          // Adjust the prompt for retry with specific feedback
-          const missingElements = validation.missing.join(', ')
-          user = user + `\n\nIMPORTANT RETRY FEEDBACK: The previous generation was missing: ${missingElements}. Please ensure you include ALL required elements, especially:
-- Navigation buttons with IDs: prevBtn, nextBtn, submitQuiz
-- Progress bar with ID: progressFill
-- Quiz questions with data-correct attributes
-- Complete JavaScript with event listeners
-- Proper HTML document structure`
-        }
+      if (!validation.valid) {
+        console.warn(
+          "Generated HTML missing required elements:",
+          validation.missing
+        );
+        // Continue anyway - design instructions should have guided the model properly
       }
+
+      // Apply basic sanitization
+      const finalHtml = sanitizeHtml(html);
+
+      const fileName = `module-${Date.now()}.html`;
+      const fullPath = path.join(GENERATED, fileName);
+
+      console.log("Generated HTML length:", finalHtml.length, "characters");
+      console.log("Writing file to:", fullPath);
+
+      fs.writeFileSync(fullPath, finalHtml, "utf-8");
+
+      // Verify file was written
+      const fileStats = fs.statSync(fullPath);
+      console.log("File written successfully. Size:", fileStats.size, "bytes");
+
+      // Return response structure expected by frontend
+      return res.json({
+        ok: true,
+        filename: fileName,
+        viewUrl: `/generated/${fileName}`,
+        downloadUrl: `/generated/${fileName}/download`,
+      });
+    } catch (err: any) {
+      console.error(err);
+      return res
+        .status(500)
+        .json({ ok: false, error: err.message || String(err) });
     }
-
-    if (!finalHtml) {
-      return res.status(500).json({ ok: false, error: 'Failed to generate valid HTML after multiple attempts' })
-    }
-
-    const fileName = `module-${Date.now()}.html`
-    const fullPath = path.join(GENERATED, fileName)
-    fs.writeFileSync(fullPath, finalHtml, 'utf-8')
-
-  // Return both a view URL and a download URL (download endpoint forces attachment)
-  return res.json({ ok: true, viewUrl: `/generated/${fileName}`, downloadUrl: `/generated/${fileName}/download` })
-  } catch (err: any) {
-    console.error(err)
-    return res.status(500).json({ ok: false, error: err.message || String(err) })
   }
-})
+);
 
-const port = Number(process.env.PORT || 5174)
-app.listen(port, () => console.log(`backend listening on http://localhost:${port}`))
+const port = Number(process.env.PORT || 5174);
+app.listen(port, () =>
+  console.log(`backend listening on http://localhost:${port}`)
+);
